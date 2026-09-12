@@ -277,6 +277,45 @@ const removed = await after('edit_file', missingInput);
 assert.equal(removed?.isError, true, 'the fallback gate reports the rejection');
 assert.equal(fs.existsSync(created), false, 'rejecting a new file must remove it');
 
+// 12b. two unpreviewable edits to ONE file in a batch: each gate must revert its OWN snapshot
+requests.length = 0;
+verdict = 'reject';
+fs.writeFileSync(target, 'one\n');
+const sameA = {file_path: target, old_string: 'NOT-THERE-A', new_string: 'two'};
+const sameB = {file_path: target, old_string: 'NOT-THERE-B', new_string: 'three'};
+await queued('edit_file', sameA, 'call-same-a');
+await before('edit_file', sameA, 'call-same-a'); // snapshot: 'one\n'
+fs.writeFileSync(target, 'two\n'); // the first edit lands
+await queued('edit_file', sameB, 'call-same-b');
+await before('edit_file', sameB, 'call-same-b'); // snapshot: 'two\n'
+fs.writeFileSync(target, 'three\n'); // the second edit lands
+const firstReject = await after('edit_file', sameA, 'call-same-a');
+const secondReject = await after('edit_file', sameB, 'call-same-b');
+assert.equal(firstReject?.isError, true, 'the first gate reports the rejection');
+assert.equal(
+	secondReject?.isError,
+	true,
+	'a second gate for the same file must still find its own snapshot (keyed per call, not per file)',
+);
+assert.equal(fs.readFileSync(target, 'utf8'), 'two\n', 'each gate restores the content its own call started from');
+
+// 12c. same-file previews are numbered, so N tabs for one file can be told apart
+requests.length = 0;
+verdict = 'accept';
+const twinA = {file_path: target, old_string: 'two', new_string: 'two-a'};
+const twinB = {file_path: target, old_string: 'two', new_string: 'two-b'};
+await queued('edit_file', twinA, 'call-twin-a');
+await queued('edit_file', twinB, 'call-twin-b');
+const twins = requests.filter((request) => request.action === 'openPreview');
+assert.equal(twins.length, 2, 'both same-file edits preview — neither invalidates the other');
+assert.match(twins[0].payload.tabName, /preview \(reject to cancel\)$/);
+assert.match(twins[1].payload.tabName, /preview #2 \(reject to cancel\)$/, 'the second tab is numbered');
+await before('edit_file', twinA, 'call-twin-a');
+await after('edit_file', twinA, 'call-twin-a');
+await before('edit_file', twinB, 'call-twin-b');
+await after('edit_file', twinB, 'call-twin-b');
+assert.ok(!lastRequest('openDiff'), 'neither same-file preview falls back to the gate');
+
 // 13. /ide-diff status reports previews, vetoes, gates and the live mode
 fs.writeFileSync(sessionFile, JSON.stringify({socketPath: currentSocketPath, workspaceFolders: [tmpRoot]}));
 const status = commands.get('ide-diff')({args: 'status'}).message;
@@ -293,4 +332,6 @@ assert.deepEqual(stray, [], 'the test must leave nothing in the real bridge dir'
 server.close();
 cleanup();
 
-console.log('e2e OK — preview at queue time, veto blocks, previewed edits skip the gate, fuzzy edits fall back');
+console.log(
+	'e2e OK — preview at queue time, veto blocks, previewed edits skip the gate, fuzzy edits fall back, same-file gates keep their own snapshot',
+);

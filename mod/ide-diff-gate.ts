@@ -344,6 +344,8 @@ export default function (cmd: ModApi): void {
 	let gatesOpened = 0;
 	const noteState = {last: ''};
 	let queue: Promise<unknown> = Promise.resolve();
+	// Keyed by tool call, not by file: one batch can edit the same file twice, and each gate must
+	// restore the content its own call started from.
 	const snapshots = new Map<string, Snapshot>();
 	let noBridgeUntil = 0;
 
@@ -371,6 +373,20 @@ export default function (cmd: ModApi): void {
 	// place a diff can be shown while the prompt is still on screen. It cannot block; the veto
 	// is recorded here and applied in beforeToolCall, which runs after the prompt is answered.
 	const previews = new Map<string, net.Socket>();
+	// Same-file edits each keep their own tab, so the title counts the lives of that file. The
+	// count is taken and bumped before the request goes out, or two previews opening at once would
+	// both call themselves the first.
+	const livePreviews = new Map<string, number>();
+	const previewTabName = (filePath: string): string => {
+		const count = (livePreviews.get(filePath) ?? 0) + 1;
+		livePreviews.set(filePath, count);
+		return `${path.basename(filePath)}  —  preview${count > 1 ? ` #${count}` : ''} (reject to cancel)`;
+	};
+	const releasePreview = (filePath: string): void => {
+		const count = livePreviews.get(filePath) ?? 0;
+		if (count <= 1) livePreviews.delete(filePath);
+		else livePreviews.set(filePath, count - 1);
+	};
 	const vetoes = new Set<string>();
 	// Tool calls that already resolved: a preview socket arriving after that is too late to show,
 	// so it is closed instead of registered (approval can beat the socket round trip).
@@ -408,13 +424,14 @@ export default function (cmd: ModApi): void {
 			const bridge = currentBridge();
 			if (!bridge) return;
 
+			const tabName = previewTabName(filePath);
 			const socket = await holdPreview(
 				bridge,
 				{
 					filePath,
 					oldContent: projection.oldContent,
 					newContent: projection.newContent,
-					tabName: `${path.basename(filePath)}  —  preview (reject to cancel)`,
+					tabName,
 				},
 				() => {
 					vetoes.add(toolCallId);
@@ -422,19 +439,24 @@ export default function (cmd: ModApi): void {
 				},
 			);
 			if (!socket) {
+				releasePreview(filePath);
 				debug(`preview ${toolName} ${filePath}: bridge unreachable`);
 				return;
 			}
 			if (settled.has(toolCallId)) {
+				releasePreview(filePath);
 				previewsLate += 1;
 				socket.destroy();
 				debug(`preview ${toolName} ${filePath}: too late, the call already resolved`);
 				return;
 			}
-			socket.on('close', () => previews.delete(toolCallId));
+			socket.on('close', () => {
+				previews.delete(toolCallId);
+				releasePreview(filePath);
+			});
 			previews.set(toolCallId, socket);
 			previewsOpened += 1;
-			debug(`preview opened for ${filePath} (${toolCallId})`);
+			debug(`preview opened for ${filePath}: ${tabName} (${toolCallId})`);
 		} catch (error) {
 			debug(`preview failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -523,7 +545,7 @@ export default function (cmd: ModApi): void {
 				return undefined;
 			}
 			const snapshot = readSnapshot(filePath);
-			if (snapshot) snapshots.set(filePath, snapshot);
+			if (snapshot) snapshots.set(toolCallId, snapshot);
 			debug(`before ${toolName} ${filePath}: snapshot exists=${snapshot?.exists}`);
 			return undefined;
 		},
@@ -554,12 +576,12 @@ export default function (cmd: ModApi): void {
 				debug(`after ${toolName} ${filePath}: skipped (enabled=${enabled} mode=${mode})`);
 				return undefined;
 			}
-			const snapshot = snapshots.get(filePath);
+			const snapshot = snapshots.get(toolCallId);
 			if (!snapshot) {
 				debug(`after ${toolName} ${filePath}: no snapshot (beforeToolCall did not run)`);
 				return undefined;
 			}
-			snapshots.delete(filePath);
+			snapshots.delete(toolCallId);
 
 			const run = async () => {
 				const bridge = currentBridge();

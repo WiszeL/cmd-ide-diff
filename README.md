@@ -124,6 +124,8 @@ Protocol — newline-delimited JSON, one request per connection:
   "oldContent":"<current content>","newContent":"<simulated result>","tabName":"auth.ts  —  preview"}}
 {"type":"response","id":"<uuid>","payload":{"result":"preview"}}      // immediate
 {"type":"response","id":"<uuid>","payload":{"result":"reject","reason":"veto"}}   // when Reject is clicked
+// A preview is never superseded: another edit to the same file simply opens its own tab, numbered
+// `#2`, `#3`… once that file has more than one live. `reject:superseded` below is a GATE reason.
 
 // mod → extension — the post-write gate, for edits that could not be simulated
 {"type":"request","id":"<uuid>","payload":{
@@ -145,7 +147,9 @@ changes.
 
 Tab lifetime is the socket's: the mod closes the preview socket when the tool result arrives (and on
 denial, interrupt, or run end), and the extension closes the tab on the disconnect. Closing the tab
-by hand only cancels the review — it never vetoes.
+by hand only cancels the review — it never vetoes. Tabs are strictly per edit: nothing one edit does
+disturbs another edit's tab, and a gate for a file that already has a pending preview opens next to
+it instead of replacing it.
 
 ## Debugging a gate that does not open
 
@@ -177,7 +181,7 @@ A bail names itself — `preview … : not projectable, the post-write gate cove
 `/ide-diff status` reports the same live state in one line: enabled, mode (+ pinned), bridge path,
 previews (and how many were vetoed), and gates opened.
 
-Two things learned the hard way, both now fixed:
+Four things learned the hard way, all now fixed:
 
 - **`cmd.getFlag` is undefined at factory time.** Reading flags there discards `--mod-option`
   silently. Apply them lazily.
@@ -185,6 +189,18 @@ Two things learned the hard way, both now fixed:
   created the file with no `beforeToolCall`/`afterToolCall` at all, while `subagent_start`/`stop`
   fired normally. The harness isolates them, so there is nothing to guard and no sub-agent counter
   in the mod.
+- **Never invalidate a preview.** Two edits to one file in one batch could stall the agent: the
+  extension superseded the older preview by `destroy()`ing its socket, so that `openPreview` — still
+  awaiting `vscode.diff` — never delivered its ACK. The mod read the dead socket as "nothing was
+  reviewed" and opened a blocking post-write gate for an edit the user had already approved in the
+  terminal, up to the full `ide-diff-timeout` of waiting, and a reject restored the snapshot and
+  wiped the edit. The same supersede also answered a pending preview with `reject:superseded`, which
+  a preview reports back as a veto — a fabricated verdict that could block an approved edit the
+  moment its prompt was answered. Previews are per edit now and nothing supersedes, drops or votes
+  on a sibling.
+- **`snapshots` was keyed by file path, not by call.** The surviving post-write gate in a same-file
+  batch reverted against a sibling call's snapshot, and the sibling found none and skipped review
+  entirely. Keyed by tool call now, so each gate restores the content its own call started from.
 
 ## Failure policy
 
@@ -192,7 +208,10 @@ Two things learned the hard way, both now fixed:
   with a one-time notice in the feed. A dropped preview socket is never read as a veto.
 - **User decision** → **fail closed**: the post-write gate treats a closed tab, a killed VS Code, a
   socket drop, a window reload, or the timeout as reject and restores the snapshot.
-- **Stray tab close** → cancels the preview only; the write is not affected.
+- **Stray tab close** → cancels that preview only; the write is not affected.
+- **Supersede** → gates only: a newer gate request for the same file answers an older unanswered gate
+  (`reject:superseded`). A preview is never superseded, dropped or voted on by a sibling — every edit
+  keeps its own tab, socket and verdict until its own call resolves.
 
 ## Known limits
 
@@ -215,8 +234,11 @@ Two things learned the hard way, both now fixed:
 7. **The gate's right pane is the real file**, so edits made there persist on Accept — Accept means
    "keep what is on disk now".
 8. **The preview tab is read-only** (both sides virtual); edits typed into it cannot be saved.
-9. **Two edits to one file in one batch** — the newest preview supersedes the older one, and the
-   older call falls back to the post-write gate.
+9. **N edits to one file in one batch** — one tab per edit, all live at once, each with its own
+   Reject, numbered when a file has more than one (`auth.ts — preview`, `auth.ts — preview #2`).
+   A newer request never invalidates an older tab. Each projection is computed at queue time against
+   the same pre-batch content, so a dependent edit (its `old_string` created by an earlier edit in
+   the same batch) cannot be projected and falls back to the post-write gate for that call.
 10. **Windows pipe has no auth token** (same as the vendor extension) — any local process can connect
     to the pipe name. Local-only; never a network service.
 11. **Sub-agent edits never reach mods** — the harness isolates them, verified. A sub-agent's write is
@@ -233,12 +255,15 @@ Two runnable checks ship with this repo — both are self-contained (no VS Code,
 node test/e2e.mjs        # the mod, against a fake bridge in its own temp dir: preview at queue
                          # time with the projected content, veto blocks the tool, a previewed edit
                          # skips the gate AND closes its socket, a fuzzy edit falls back to the
-                         # gate, a binary gets no preview, an unreadable file is never gated or
+                         # gate, two edits to one file in one batch gate against their own
+                         # snapshots, a binary gets no preview, an unreadable file is never gated or
                          # deleted, rejecting a new file removes it, auto-accept previews nothing,
                          # a dead bridge fails OPEN, and nothing is left in the real bridge dir
 node test/extension.cjs  # the extension with a stubbed `vscode` and a stubbed homedir:
-                         # preview ack + veto context + drop→tab closes, gate accept and
-                         # close→reject, ping, cleanup
+                         # preview ack + veto context + drop→tab closes, two same-file previews that
+                         # each keep their own tab, socket and Reject, a gate that opens next to a
+                         # pending preview without voting on it, gate accept and close→reject, ping,
+                         # cleanup
 node --check extension/extension.js
 ```
 
@@ -259,9 +284,15 @@ End-to-end in a real editor (the part a test cannot cover):
    bar. Answer Yes → the edit lands, the tab closes by itself, nothing else is asked.
 5. Ask again → click **Reject**, then answer Yes → the model is told the edit was rejected, the file
    is untouched (`git diff` empty).
-6. Ask for an edit that needs fuzzy matching → no preview, and the post-write Accept/Reject gate runs.
-7. shift+tab to `auto-accept` → edits land with no tab at all; `/ide-diff status` reports the mode.
-8. Failure modes: a dead bridge (`mv` the session file) → no preview, edit applies, one notice.
+6. Ask for **two edits to the same file in one message** → two preview tabs (`file — preview`,
+   `file — preview #2`), both live while both prompts are open; Reject on the active tab vetoes only
+   that edit. Answer both prompts Yes → each tab closes with its own call, no Accept/Reject tab
+   appears afterwards and the agent carries on. `tail ~/.commandcode/ide-diff/gate.log` shows no
+   `bridge unreachable` and no `gate: opening` for that file — just `preview opened …` lines and
+   `after edit_file …: previewed at prompt time → no second ask`.
+7. Ask for an edit that needs fuzzy matching → no preview, and the post-write Accept/Reject gate runs.
+8. shift+tab to `auto-accept` → edits land with no tab at all; `/ide-diff status` reports the mode.
+9. Failure modes: a dead bridge (`mv` the session file) → no preview, edit applies, one notice.
 
 Cross-platform note: only the Linux/macOS paths are exercised here. Windows is code-reviewed, not
-run — re-run steps 2–8 on Windows (or via WSL + VS Code Remote, which uses the Unix path).
+run — re-run steps 2–9 on Windows (or via WSL + VS Code Remote, which uses the Unix path).

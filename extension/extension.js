@@ -14,7 +14,9 @@ const OUT = vscode.window.createOutputChannel("Command Code Diff Gate");
 
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
-const MAX_CONNECTIONS = 16;
+// One connection per open diff tab, held for the whole prompt: same-file edits each keep their own
+// preview, so this must clear a realistic batch with room to spare.
+const MAX_CONNECTIONS = 64;
 const IDLE_TIMEOUT_MS = 60_000;
 // A preview waits on a human reading a terminal prompt, so its socket must outlive the default.
 const PREVIEW_IDLE_TIMEOUT_MS = 30 * 60_000;
@@ -142,19 +144,13 @@ const answerActiveTab = async (verdict) => {
 	if (active) await resolveRequest(active.requestId, verdict);
 };
 
-// Last writer wins: a newer request for the same file supersedes an unanswered one.
+// Last writer wins for unanswered GATES only. Previews are never superseded: every edit keeps its
+// own tab, socket and verdict until its own call resolves.
 const supersedePendingForFile = async (filePath, exceptRequestId) => {
-	for (const [requestId, entry] of pending) {
+	for (const [requestId, entry] of [...pending]) {
+		if (entry.phase !== "gate") continue;
 		if (entry.filePath === filePath && requestId !== exceptRequestId && !entry.answered) {
 			await resolveRequest(requestId, "reject:superseded");
-		}
-	}
-};
-
-const supersedePreviewsForFile = async (filePath, exceptRequestId) => {
-	for (const [requestId, entry] of pending) {
-		if (entry.phase === "preview" && entry.filePath === filePath && requestId !== exceptRequestId) {
-			await discardRequest(requestId);
 		}
 	}
 };
@@ -189,7 +185,6 @@ const openPreview = async (request, socket) => {
 	const {left, right} = diffUris(request.requestId, request.filePath);
 	const title = tabTitle(request);
 
-	await supersedePreviewsForFile(request.filePath, request.requestId);
 	pending.set(request.requestId, {
 		// A preview has exactly one meaningful answer, and it is always "no".
 		notify: () => send(socket, {type: "response", id: request.requestId, payload: {result: "reject", reason: "veto"}}),
@@ -202,6 +197,13 @@ const openPreview = async (request, socket) => {
 	});
 
 	await vscode.commands.executeCommand("vscode.diff", left, right, title, {preview: false, preserveFocus: true});
+	// Opening a diff is async: the entry can be gone by the time it lands (the mod's socket died, a
+	// window reload, a dispose). Then the tab it just left behind must go with it.
+	if (!pending.has(request.requestId)) {
+		const tab = findDiffTab(request.requestId);
+		if (tab) await vscode.window.tabGroups.close(tab);
+		return;
+	}
 	await refreshGateContext();
 };
 
