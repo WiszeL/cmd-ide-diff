@@ -1,0 +1,48 @@
+{
+	"name": "ide-diff",
+	"displayName": "Command Code IDE Diff Gate",
+	"description": "Native VS Code diff review with Accept/Reject for Command Code edits (default permission mode only).",
+	"publisher": "wiszel",
+	"version": "0.0.1",
+	"private": true,
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/WiszeL/cmd-ide-diff.git"
+	},
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"main": "./extension.js",
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"contributes": {
+		"commands": [
+			{
+				"command": "ccDiff.accept",
+				"title": "Accept",
+				"icon": "$(check)"
+			},
+			{
+				"command": "ccDiff.reject",
+				"title": "Reject",
+				"icon": "$(close)"
+			}
+		],
+		"menus": {
+			"editor/title": [
+				{
+					"command": "ccDiff.accept",
+					"when": "ccDiffGateActive",
+					"group": "navigation@1"
+				},
+				{
+					"command": "ccDiff.reject",
+					"when": "ccDiffGateActive || ccDiffVetoActive",
+					"group": "navigation@2"
+				}
+			]
+		}
+	}
+}

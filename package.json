@@ -1,0 +1,10 @@
+{
+	"name": "cmd-ide-diff",
+	"version": "0.0.1",
+	"description": "Native VS Code diff review with Accept/Reject for Command Code edits.",
+	"license": "MIT",
+	"private": true,
+	"commandcode": {
+		"mods": ["./mod/ide-diff-gate.ts"]
+	}
+}
