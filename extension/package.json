@@ -3,7 +3,7 @@
 	"displayName": "Command Code IDE Diff Gate",
 	"description": "Native VS Code diff review with Accept/Reject for Command Code edits (default permission mode only).",
 	"publisher": "wiszel",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"private": true,
 	"license": "MIT",
 	"repository": {
